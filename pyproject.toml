@@ -27,6 +27,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["ruff", "typos"]
 
+[project.scripts]
+hweEval = "hwe_bench.hwe_eval:main"
+
 [tool.setuptools.packages.find]
 include = ["hwe_bench*"]
 exclude = ["hwe_bench.harness.artifacts*"]
