@@ -30,6 +30,14 @@ class ClaudeCode(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
     memory_dir: str | None
 
+    CCR_PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
+        "dashscope": {
+            "api_base_url": "https://coding.dashscope.aliyuncs.com/v1/chat/completions",
+            "api_key_env": "DASHSCOPE_API_KEY",
+            "transformer": {"use": ["enhancetool"]},
+        },
+    }
+
     CLI_FLAGS = [
         CliFlag(
             "max_turns",
@@ -112,11 +120,11 @@ class ClaudeCode(BaseInstalledAgent):
             environment,
             command=(
                 "if command -v apk &> /dev/null; then"
-                "  apk add --no-cache curl bash nodejs npm;"
+                "  apk add --no-cache curl bash nodejs npm unzip;"
                 " elif command -v apt-get &> /dev/null; then"
-                "  apt-get update && apt-get install -y curl;"
+                "  apt-get update && apt-get install -y curl unzip;"
                 " elif command -v yum &> /dev/null; then"
-                "  yum install -y curl;"
+                "  yum install -y curl unzip;"
                 " else"
                 '  echo "Warning: No known package manager found, assuming curl is available" >&2;'
                 " fi"
@@ -130,9 +138,13 @@ class ClaudeCode(BaseInstalledAgent):
             command=(
                 "set -euo pipefail; "
                 "if command -v apk &> /dev/null; then"
-                f"  npm install -g @anthropic-ai/claude-code{'@' + self._version if self._version else ''};"
+                f"  npm install -g @anthropic-ai/claude-code{'@' + self._version if self._version else ''}"
+                " && curl -fsSL https://bun.sh/install | bash"
+                " && $HOME/.bun/bin/bun --version;"
                 " else"
-                f"  curl -fsSL https://claude.ai/install.sh | bash -s --{version_flag};"
+                f"  curl -fsSL https://claude.ai/install.sh | bash -s --{version_flag}"
+                " && curl -fsSL https://bun.sh/install | bash"
+                " && $HOME/.bun/bin/bun --version;"
                 " fi && "
                 "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc && "
                 'export PATH="$HOME/.local/bin:$PATH" && '
@@ -963,6 +975,68 @@ class ClaudeCode(BaseInstalledAgent):
             return True
         return False
 
+    @staticmethod
+    def _should_use_ccr(model_name: str | None) -> bool:
+        """Determine if claude-code-router should proxy this model."""
+        if os.environ.get("CCR_FORCE_DIRECT", "").strip() == "1":
+            return False
+        if not model_name:
+            return False
+        if model_name.startswith("anthropic/"):
+            return False
+        return True
+
+    def _build_ccr_config_json(self) -> str:
+        """Build CCR config.json content. Returns JSON string or raises RuntimeError."""
+        override = self._get_env("CCR_CONFIG_JSON")
+        if override:
+            return override
+
+        if not self.model_name or "/" not in self.model_name:
+            raise RuntimeError(
+                f"Invalid model format for CCR: '{self.model_name}'. "
+                "Expected 'provider/model' (e.g., 'dashscope/qwen3.6-plus'). "
+                "Or set CCR_CONFIG_JSON for full custom configuration."
+            )
+
+        provider, _, model = self.model_name.partition("/")
+        if not provider or not model:
+            raise RuntimeError(
+                f"Invalid model format for CCR: '{self.model_name}'. "
+                "Expected 'provider/model' (e.g., 'dashscope/qwen3.6-plus')."
+            )
+
+        preset = self.CCR_PROVIDER_PRESETS.get(provider)
+        if not preset:
+            raise RuntimeError(
+                f"No CCR preset for provider '{provider}'. "
+                "Set CCR_CONFIG_JSON env var to provide full CCR configuration, "
+                "or add a preset to CCR_PROVIDER_PRESETS."
+            )
+
+        api_key_env = str(preset["api_key_env"])
+        if not self._get_env(api_key_env):
+            raise RuntimeError(
+                f"CCR provider '{provider}' requires {api_key_env} to be set. "
+                f"Use --ae {api_key_env}=<your-key>"
+            )
+
+        config: dict[str, object] = {
+            "NON_INTERACTIVE_MODE": True,
+            "LOG": True,
+            "Providers": [
+                {
+                    "name": provider,
+                    "api_base_url": preset["api_base_url"],
+                    "api_key": f"${api_key_env}",
+                    "models": [model],
+                    "transformer": preset.get("transformer", {}),
+                }
+            ],
+            "Router": {"default": f"{provider},{model}"},
+        }
+        return json.dumps(config)
+
     @with_prompt_template
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
@@ -970,6 +1044,10 @@ class ClaudeCode(BaseInstalledAgent):
         escaped_instruction = shlex.quote(instruction)
 
         use_bedrock = self._is_bedrock_mode()
+
+        use_ccr = False
+        if not use_bedrock:
+            use_ccr = self._should_use_ccr(self.model_name)
 
         env = {
             "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY")
@@ -1017,6 +1095,15 @@ class ClaudeCode(BaseInstalledAgent):
             # Optional: disable prompt caching (not available in all regions)
             if os.environ.get("DISABLE_PROMPT_CACHING", "").strip() == "1":
                 env["DISABLE_PROMPT_CACHING"] = "1"
+
+        # CCR routing: redirect Claude Code through local proxy for non-Anthropic models
+        ccr_config_json: str | None = None
+        if use_ccr:
+            ccr_config_json = self._build_ccr_config_json()
+            env["ANTHROPIC_API_KEY"] = "ccr"
+            env["ANTHROPIC_BASE_URL"] = "http://localhost:3456"
+            env["NO_PROXY"] = "127.0.0.1,localhost"
+            env["CLAUDE_CODE_DISABLE_COST_WARNINGS"] = "1"
 
         # Remove empty auth credentials to allow Claude CLI to prioritize the available method
         # When both are empty, Claude CLI will fail with a clear authentication error
@@ -1084,6 +1171,12 @@ class ClaudeCode(BaseInstalledAgent):
         if mcp_command:
             setup_command += f" && {mcp_command}"
 
+        if use_ccr and ccr_config_json:
+            setup_command += (
+                f" && mkdir -p ~/.claude-code-router && "
+                f"echo {shlex.quote(ccr_config_json)} > ~/.claude-code-router/config.json"
+            )
+
         cli_flags = self.build_cli_flags()
         extra_flags = (cli_flags + " ") if cli_flags else ""
 
@@ -1092,15 +1185,33 @@ class ClaudeCode(BaseInstalledAgent):
             command=setup_command,
             env=env,
         )
+
+        claude_cmd = (
+            f"claude --verbose --output-format=stream-json "
+            f"--permission-mode=bypassPermissions "
+            f"{extra_flags}"
+            f"--print -- {escaped_instruction} 2>&1 </dev/null | tee "
+            f"/logs/agent/claude-code.txt"
+        )
+
+        if use_ccr:
+            run_command = (
+                'export PATH="$HOME/.local/bin:$PATH"; '
+                "ccr_cleanup() { kill $CCR_PID 2>/dev/null || true; }; "
+                "trap ccr_cleanup EXIT; "
+                "nohup $HOME/.bun/bin/bunx @musistudio/claude-code-router start > /logs/agent/ccr.log 2>&1 & "
+                "CCR_PID=$!; "
+                "for _ in $(seq 1 60); do "
+                "  curl -s --max-time 1 http://localhost:3456 > /dev/null 2>&1 && break; "
+                "  sleep 1; "
+                "done; "
+                f"{claude_cmd}"
+            )
+        else:
+            run_command = f'export PATH="$HOME/.local/bin:$PATH"; {claude_cmd}'
+
         await self.exec_as_agent(
             environment,
-            command=(
-                'export PATH="$HOME/.local/bin:$PATH"; '
-                f"claude --verbose --output-format=stream-json "
-                f"--permission-mode=bypassPermissions "
-                f"{extra_flags}"
-                f"--print -- {escaped_instruction} 2>&1 </dev/null | tee "
-                f"/logs/agent/claude-code.txt"
-            ),
+            command=run_command,
             env=env,
         )

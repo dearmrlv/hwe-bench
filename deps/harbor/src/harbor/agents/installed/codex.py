@@ -33,6 +33,13 @@ class Codex(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
     _OUTPUT_FILENAME = "codex.txt"
 
+    CODEX_PROVIDER_PRESETS: dict[str, dict[str, str]] = {
+        "dashscope": {
+            "base_url": "https://coding.dashscope.aliyuncs.com/v1",
+            "env_key": "OPENAI_API_KEY",
+        },
+    }
+
     CLI_FLAGS = [
         CliFlag(
             "reasoning_effort",
@@ -115,6 +122,17 @@ class Codex(BaseInstalledAgent):
                 '    ln -sf "$BIN_PATH" "/usr/local/bin/$bin";'
                 "  fi;"
                 " done"
+            ),
+        )
+        # Install go-llm-proxy for non-OpenAI provider support
+        await self.exec_as_root(
+            environment,
+            command=(
+                "curl -fsSL -o /tmp/proxy.tar.gz "
+                "'https://github.com/yatesdr/go-llm-proxy/releases/latest/download/go-llm-proxy-linux-amd64.tar.gz' && "
+                "tar -xzf /tmp/proxy.tar.gz -C /usr/local/bin/ go-llm-proxy && "
+                "chmod +x /usr/local/bin/go-llm-proxy && "
+                "rm /tmp/proxy.tar.gz"
             ),
         )
 
@@ -628,6 +646,67 @@ class Codex(BaseInstalledAgent):
 
         return None
 
+    @staticmethod
+    def _should_use_custom_provider(model_name: str | None) -> bool:
+        """Detect if model needs a custom provider config.toml."""
+        if not model_name:
+            return False
+        if model_name.startswith("openai/"):
+            return False
+        return True
+
+    def _build_codex_config_toml(self) -> str | None:
+        """Build $CODEX_HOME/config.toml pointing Codex to local go-llm-proxy."""
+        if not self.model_name:
+            return None
+        provider = self.model_name.split("/")[0] if "/" in self.model_name else None
+        if not provider or provider not in self.CODEX_PROVIDER_PRESETS:
+            return None
+        parts: list[str] = []
+        model = self.model_name.split("/")[-1]
+        parts.extend([
+            f'model = "{model}"',
+            'model_provider = "go-llm-proxy"',
+            'model_reasoning_effort = "high"',
+            'web_search = "disabled"',
+            "",
+            '[model_providers.go-llm-proxy]',
+            'name = "Go-LLM-Proxy"',
+            'base_url = "http://localhost:3456/v1"',
+            'env_key = "OPENAI_API_KEY"',
+            'wire_api = "responses"',
+        ])
+        if self.mcp_servers:
+            parts.append("")
+            for server in self.mcp_servers:
+                parts.append(f"[mcp_servers.{server.name}]")
+                if server.transport == "stdio":
+                    cmd_parts = [server.command] + (server.args if server.args else [])
+                    parts.append(f'command = "{shlex.join(cmd_parts)}"')
+                else:
+                    parts.append(f'url = "{server.url}"')
+                parts.append("")
+        return "\n".join(parts)
+
+    def _build_proxy_config_yaml(self) -> str | None:
+        """Build go-llm-proxy config.yaml for the current provider/model."""
+        if not self.model_name or "/" not in self.model_name:
+            return None
+        provider = self.model_name.split("/")[0]
+        if provider not in self.CODEX_PROVIDER_PRESETS:
+            return None
+        preset = self.CODEX_PROVIDER_PRESETS[provider]
+        api_key = self._get_env(preset["env_key"]) or ""
+        model = self.model_name.split("/")[-1]
+        return (
+            'listen: ":3456"\n'
+            "models:\n"
+            f"  - name: {model}\n"
+            f"    backend: {preset['base_url']}\n"
+            f"    api_key: {api_key}\n"
+            f"    responses_mode: translate\n"
+        )
+
     @with_prompt_template
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
@@ -639,15 +718,34 @@ class Codex(BaseInstalledAgent):
 
         model = self.model_name.split("/")[-1]
 
+        use_custom_provider = self._should_use_custom_provider(self.model_name)
+
+        if use_custom_provider:
+            provider = self.model_name.split("/")[0] if "/" in self.model_name else ""
+            if provider not in self.CODEX_PROVIDER_PRESETS:
+                raise RuntimeError(
+                    f"No Codex preset for provider '{provider}'. "
+                    "Add to CODEX_PROVIDER_PRESETS."
+                )
+            if not self._get_env("OPENAI_API_KEY"):
+                raise RuntimeError(
+                    f"Custom provider '{provider}' requires OPENAI_API_KEY. "
+                    "Use --ae OPENAI_API_KEY=<your-key>"
+                )
+
         # Build command with optional CLI config flags from descriptors.
         cli_flags = self.build_cli_flags()
         cli_flags_arg = (cli_flags + " ") if cli_flags else ""
 
         # Auth resolution:
-        #   1. CODEX_FORCE_API_KEY=1 → always use OPENAI_API_KEY, skip auth.json
-        #   2. CODEX_AUTH_JSON_PATH=<path> → use that specific auth.json file
-        #   3. Default: use ~/.codex/auth.json if it exists, else OPENAI_API_KEY
-        auth_json_path = self._resolve_auth_json_path()
+        #   1. Custom provider → force API key mode (skip auth.json)
+        #   2. CODEX_FORCE_API_KEY=1 → always use OPENAI_API_KEY, skip auth.json
+        #   3. CODEX_AUTH_JSON_PATH=<path> → use that specific auth.json file
+        #   4. Default: use ~/.codex/auth.json if it exists, else OPENAI_API_KEY
+        if use_custom_provider:
+            auth_json_path = None
+        else:
+            auth_json_path = self._resolve_auth_json_path()
 
         env: dict[str, str] = {
             "CODEX_HOME": EnvironmentPaths.agent_dir.as_posix(),
@@ -671,8 +769,8 @@ class Codex(BaseInstalledAgent):
             env["OPENAI_BASE_URL"] = openai_base_url
 
         setup_command = ""
-        if not auth_json_path:
-            # Write a synthetic auth.json for API key auth
+        if not auth_json_path and not use_custom_provider:
+            # Write a synthetic auth.json for API key auth (openai provider only)
             setup_command += (
                 "mkdir -p /tmp/codex-secrets\n"
                 "cat >/tmp/codex-secrets/auth.json <<EOF\n"
@@ -680,13 +778,28 @@ class Codex(BaseInstalledAgent):
                 'ln -sf /tmp/codex-secrets/auth.json "$CODEX_HOME/auth.json"\n'
             )
 
+        if use_custom_provider:
+            proxy_yaml = self._build_proxy_config_yaml()
+            config_toml = self._build_codex_config_toml()
+            if proxy_yaml:
+                setup_command += (
+                    f"mkdir -p /tmp/go-llm-proxy && "
+                    f"echo {shlex.quote(proxy_yaml)} > /tmp/go-llm-proxy/config.yaml\n"
+                )
+            if config_toml:
+                escaped_toml = shlex.quote(config_toml)
+                setup_command += f"echo {escaped_toml} > $CODEX_HOME/config.toml\n"
+            # Dummy key so Codex doesn't complain — proxy doesn't validate it
+            env["OPENAI_API_KEY"] = self._get_env("OPENAI_API_KEY") or "ccr"
+
         skills_command = self._build_register_skills_command()
         if skills_command:
             setup_command += f"\n{skills_command}"
 
-        mcp_command = self._build_register_mcp_servers_command()
-        if mcp_command:
-            setup_command += f"\n{mcp_command}"
+        if not use_custom_provider:
+            mcp_command = self._build_register_mcp_servers_command()
+            if mcp_command:
+                setup_command += f"\n{mcp_command}"
 
         if setup_command.strip():
             await self.exec_as_agent(
@@ -694,24 +807,42 @@ class Codex(BaseInstalledAgent):
                 command=setup_command,
                 env=env,
             )
+
+        codex_cmd = (
+            "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+            "codex exec "
+            "--dangerously-bypass-approvals-and-sandbox "
+            "--skip-git-repo-check "
+            f"--model {model} "
+            "--json "
+            "--enable unified_exec "
+            f"{cli_flags_arg}"
+            "-- "  # end of flags
+            f"{escaped_instruction} "
+            f"2>&1 </dev/null | tee {EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME}"
+        )
+
+        if use_custom_provider:
+            run_command = (
+                'export PATH="$HOME/.local/bin:$PATH"; '
+                "proxy_cleanup() { kill $PROXY_PID 2>/dev/null || true; }; "
+                "trap proxy_cleanup EXIT; "
+                "nohup go-llm-proxy -config /tmp/go-llm-proxy/config.yaml "
+                "> /logs/agent/proxy.log 2>&1 & "
+                "PROXY_PID=$!; "
+                "for _ in $(seq 1 20); do "
+                "  curl -s --max-time 1 http://localhost:3456/v1/models > /dev/null 2>&1 && break; "
+                "  sleep 1; "
+                "done; "
+                f"{codex_cmd}"
+            )
+        else:
+            run_command = codex_cmd
+
         try:
             await self.exec_as_agent(
                 environment,
-                command=(
-                    "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
-                    "codex exec "
-                    "--dangerously-bypass-approvals-and-sandbox "
-                    "--skip-git-repo-check "
-                    f"--model {model} "
-                    "--json "
-                    "--enable unified_exec "
-                    f"{cli_flags_arg}"
-                    "-- "  # end of flags
-                    f"{escaped_instruction} "
-                    f"2>&1 </dev/null | tee {
-                        EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME
-                    }"
-                ),
+                command=run_command,
                 env=env,
             )
         finally:

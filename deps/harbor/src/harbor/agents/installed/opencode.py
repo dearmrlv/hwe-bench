@@ -1,6 +1,5 @@
 import copy
 import json
-import os
 import shlex
 from datetime import datetime, timezone
 from typing import Any
@@ -358,12 +357,18 @@ class OpenCode(BaseInstalledAgent):
         if self.model_name and "/" in self.model_name:
             provider, model_id = self.model_name.split("/", 1)
             provider_config: dict[str, Any] = {"models": {model_id: {}}}
-            base_url = os.environ.get("OPENAI_BASE_URL")
+            if provider in self.OPENCODE_ANTHROPIC_PROVIDERS:
+                provider_config["npm"] = "@ai-sdk/anthropic"
+                provider_config.setdefault("options", {})[
+                    "baseURL"
+                ] = self.OPENCODE_ANTHROPIC_PROVIDERS[provider]
+            base_url = self._get_env("OPENAI_BASE_URL")
             if base_url and provider == "openai":
-                # opencode reads baseURL from provider.options, not the provider root.
-                # See: https://github.com/anomalyco/opencode config.ts ProviderConfig schema.
                 provider_config.setdefault("options", {})["baseURL"] = base_url
             config["provider"] = {provider: provider_config}
+
+        # Force build agent so opencode run actually implements changes
+        config["default_agent"] = "build"
 
         # Layer: defaults → auto-generated → job-level overrides.
         # Deep-merge preserves sibling keys within nested dicts (e.g. provider, experimental).
@@ -376,6 +381,11 @@ class OpenCode(BaseInstalledAgent):
         config_json = json.dumps(config, indent=2)
         escaped = shlex.quote(config_json)
         return f"mkdir -p ~/.config/opencode && echo {escaped} > ~/.config/opencode/opencode.json"
+
+    # Providers that speak Anthropic Messages API natively
+    OPENCODE_ANTHROPIC_PROVIDERS: dict[str, str] = {
+        "dashscope": "https://coding.dashscope.aliyuncs.com/apps/anthropic/v1",
+    }
 
     @with_prompt_template
     async def run(
@@ -434,6 +444,8 @@ class OpenCode(BaseInstalledAgent):
             keys.append("XAI_API_KEY")
         elif provider == "openrouter":
             keys.append("OPENROUTER_API_KEY")
+        elif provider in self.OPENCODE_ANTHROPIC_PROVIDERS:
+            keys.append("ANTHROPIC_API_KEY")
         else:
             raise ValueError(
                 f"Unknown provider {provider}. If you believe this provider "
@@ -441,8 +453,9 @@ class OpenCode(BaseInstalledAgent):
             )
 
         for key in keys:
-            if key in os.environ:
-                env[key] = os.environ[key]
+            val = self._get_env(key)
+            if val:
+                env[key] = val
 
         # Enable fake VCS for OpenCode
         env["OPENCODE_FAKE_VCS"] = "git"
@@ -457,11 +470,11 @@ class OpenCode(BaseInstalledAgent):
 
         await self.exec_as_agent(
             environment,
-            # Note that the --thinking flag just means thinking blocks will be included in the json formatted output
             command=(
                 ". ~/.nvm/nvm.sh; "
-                f"opencode --model={self.model_name} run --format=json --thinking --dangerously-skip-permissions -- {escaped_instruction} "
-                f"2>&1 </dev/null | stdbuf -oL tee /logs/agent/opencode.txt"
+                f"opencode --model={self.model_name} run --agent build --format=json --dangerously-skip-permissions"
+                f" -- {escaped_instruction} "
+                f"2>&1 | stdbuf -oL tee /logs/agent/{self._OUTPUT_FILENAME}"
             ),
             env=env,
         )

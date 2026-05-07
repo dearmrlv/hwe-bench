@@ -54,6 +54,23 @@ Codex also accepts an OpenAI API key via `OPENAI_API_KEY` for pay-as-you-go bill
 
 OAuth tokens carry one constraint worth surfacing: the `access_token` inside `auth.json` has a 10-day lifetime (visible as the `exp` claim in its JWT payload, and recorded alongside a `last_refresh` timestamp in the file). Check that it has not expired before starting a long run; if it has, run `codex login` on the host to refresh `auth.json`, then launch `harbor run`.
 
+#### Non-OpenAI models via Codex (auto proxy routing)
+
+When `-m` specifies a non-OpenAI model (e.g., `dashscope/qwen3.6-plus`), the agent automatically starts a local [go-llm-proxy](https://github.com/yatesdr/go-llm-proxy) daemon inside the container. The proxy translates Codex's Responses API (`/v1/responses`) to the upstream provider's Chat Completions API transparently. No extra flags are required; the agent detects the model prefix and handles routing internally.
+
+```bash
+export DASHSCOPE_API_KEY=sk-xxxxx
+harbor run --path tasks/hwe-bench-<repo>/ \
+  -a codex -m dashscope/qwen3.6-plus \
+  --ae OPENAI_API_KEY="$DASHSCOPE_API_KEY" \
+  --ak reasoning_effort=xhigh \
+  -k 1 -r 2 --n-concurrent 1 --no-delete \
+  --agent-setup-timeout-multiplier 4.0 \
+  --job-name hwe-<repo>-codex-qwen
+```
+
+Routing logic: models starting with `openai/` use the standard auth.json flow. All other models route through the proxy on `localhost:3456`. Increase `--agent-setup-timeout-multiplier` to 4.0 to accommodate the proxy binary download (~10 MB). For providers without a built-in preset, add an entry to the `CODEX_PROVIDER_PRESETS` dict in `deps/harbor/src/harbor/agents/installed/codex.py`.
+
 ### Claude Code (Anthropic)
 
 Claude Code accepts a long-lived OAuth token via `CLAUDE_CODE_OAUTH_TOKEN`, suitable for non-interactive container use. Generate one on the host with `claude setup-token` (requires an active Claude Pro / Max / Team / Enterprise subscription); the resulting token is valid for one year. Explicitly clear `ANTHROPIC_API_KEY` inside the container: Claude Code prefers the API key over the OAuth token when both are set, and a stray host-side key (even a zero-balance one) will make the agent abort with "credit balance too low". For further details on Claude Code authentication, see <https://code.claude.com/docs/en/authentication>.
@@ -73,6 +90,43 @@ harbor run --path tasks/hwe-bench-<repo>/ \
 ```
 
 Disallowing `WebSearch` and `WebFetch` is a leakage precaution: it stops the agent from looking up the upstream fix commit on GitHub. Raising `CLAUDE_CODE_MAX_OUTPUT_TOKENS` from the default 64k to 128k avoids thinking-loop truncation on longer multi-file edits. Swap the model identifier to `anthropic/claude-opus-4-6` for Opus runs; the remaining flags carry over.
+
+#### Non-Anthropic models via Claude Code (auto CCR routing)
+
+When `-m` specifies a non-Anthropic model (e.g., `dashscope/qwen3.6-plus`), the agent automatically starts a local [claude-code-router](https://github.com/musistudio/claude-code-router) daemon inside the container. Claude Code runs unchanged — only its API traffic is proxied through the router. No extra flags are required; the agent detects the model prefix and handles routing internally.
+
+```bash
+export DASHSCOPE_API_KEY=sk-xxxxx
+harbor run --path tasks/hwe-bench-<repo>/ \
+  -a claude-code -m dashscope/qwen3.6-plus \
+  --ak max_turns=500 \
+  --ak reasoning_effort=high \
+  --ak "disallowed_tools=WebSearch,WebFetch" \
+  --ae DASHSCOPE_API_KEY="$DASHSCOPE_API_KEY" \
+  -k 1 -r 2 --n-concurrent 1 --no-delete \
+  --agent-setup-timeout-multiplier 2.0 \
+  --job-name hwe-<repo>-qwen
+```
+
+Routing logic: models starting with `anthropic/` connect directly to Anthropic. All other models route through CCR on `localhost:3456`. Set `CCR_FORCE_DIRECT=1` to bypass CCR and force direct Anthropic connection regardless of model. For providers without a built-in preset, set the `CCR_CONFIG_JSON` environment variable with a full CCR configuration (see the [CCR docs](https://github.com/musistudio/claude-code-router) for the config schema).
+
+### OpenCode
+
+OpenCode is a model-agnostic terminal agent. Its built-in SDK adapter system (`@ai-sdk/anthropic`, `@ai-sdk/openai`, etc.) handles protocol selection per provider — no external proxy is required. When `-m` specifies a provider registered in `OPENCODE_ANTHROPIC_PROVIDERS` (e.g., `dashscope`), the agent writes an opencode config that selects the Anthropic Messages SDK adapter and points it at the provider's Anthropic-compatible endpoint. For providers not in the registry, the standard `openai/` path with `OPENAI_BASE_URL` works as usual.
+
+DashScope via Anthropic endpoint:
+
+```bash
+export DASHSCOPE_API_KEY=sk-xxxxx
+harbor run --path tasks/hwe-bench-<repo>/ \
+  -a opencode -m dashscope/qwen3.6-plus \
+  --ae ANTHROPIC_API_KEY="$DASHSCOPE_API_KEY" \
+  -k 1 -r 2 --n-concurrent 1 --no-delete \
+  --agent-setup-timeout-multiplier 3.0 \
+  --job-name hwe-<repo>-opencode-qwen
+```
+
+Anthropic Messages API-compatible endpoints follow the same `provider/model` pattern (`anthropic/claude-sonnet-4-6`, `dashscope/qwen3.6-plus`). OpenAI API-compatible endpoints use `openai/<model>` with optional `OPENAI_BASE_URL`. For the full provider registry and SDK adapter mapping, see [opencode-integration.md](../opencode-integration.md).
 
 ### Kimi CLI (Moonshot)
 
